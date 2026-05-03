@@ -3,17 +3,16 @@
 
 export const SYMBOLS = ["🍎","🍋","🍇","🍓","🔥","⭐","🎯","🍀","💎","🌙"]
 
+// TASK 1 — PUPPETEER and POSITION_SWAP removed
 export const SPECIALS = [
   { type: 'REVERSE',         emoji: '🔄', name: 'Reverse'         },
   { type: 'FREEZE',          emoji: '🧊', name: 'Freeze'           },
   { type: 'BLIND_SNATCH',    emoji: '🎲', name: 'Blind Snatch'     },
-  { type: 'REVEALED_SNATCH', emoji: '👁', name: 'Revealed Snatch'  },
+  { type: 'REVEALED_SNATCH', emoji: '👁',  name: 'Revealed Snatch'  },
   { type: 'STUN_GRENADE',    emoji: '💥', name: 'Stun Grenade'     },
   { type: 'VITALS',          emoji: '📊', name: 'Vitals'           },
   { type: 'SUPER_VITALS',    emoji: '⚡', name: 'Super Vitals'     },
   { type: 'NUKE',            emoji: '💣', name: 'Nuke'             },
-  { type: 'PUPPETEER',       emoji: '🎭', name: 'Puppeteer'        },
-  { type: 'POSITION_SWAP',   emoji: '🔀', name: 'Position Swap'    },
 ]
 
 export const SPECIAL_CONFIG = {
@@ -25,8 +24,73 @@ export const SPECIAL_CONFIG = {
   STUN_GRENADE:   { timing: 'ANYTIME',   consume: true, kind: 'EFFECT',             trigger: 'UNTIL_TARGET_PASS',       expires: 'AFTER_TARGET_PASS' },
   VITALS:         { timing: 'ANYTIME',   consume: true, kind: 'SNAPSHOT' },
   SUPER_VITALS:   { timing: 'ANYTIME',   consume: true, kind: 'ROUND_EFFECT',       trigger: 'AFTER_CARD_CHANGE',       expires: 'ROUND_END' },
-  POSITION_SWAP:  { timing: 'TURN_ONLY', consume: true, kind: 'EFFECT',             trigger: 'AFTER_OWNER_NORMAL_PASS', expires: 'ONCE' },
-  PUPPETEER:      { timing: 'ANYTIME',   consume: true, kind: 'TURN_CONTROL',       trigger: 'ON_TARGET_TURN',          expires: 'AFTER_TARGET_PASS' },
+}
+
+// Types that are no longer valid (kept for backward compat / sanitize)
+const REMOVED_SPECIAL_TYPES = new Set(['PUPPETEER', 'POSITION_SWAP'])
+
+// ── TASK 1 — sanitizeRoom ─────────────────────────────────────────
+// Remove old Puppeteer/Position Swap artefacts from rooms loaded from Redis.
+export function sanitizeRoom(room) {
+  if (!room) return room
+
+  // Remove removed special cards from all player hands
+  if (Array.isArray(room.players)) {
+    room.players.forEach(p => {
+      if (Array.isArray(p.chits)) {
+        p.chits = p.chits.filter(c => {
+          if (c && typeof c === 'object' && c.special === true) {
+            return !REMOVED_SPECIAL_TYPES.has(c.type)
+          }
+          return true
+        })
+      }
+      // Ensure bot/online fields always exist (Task 8/9)
+      if (p.online        === undefined) p.online        = true
+      if (p.botActive     === undefined) p.botActive     = false
+      if (p.disconnectedAt=== undefined) p.disconnectedAt= null
+      if (p.isBot         === undefined) p.isBot         = false
+    })
+  }
+
+  // Clear puppeteer state
+  room.puppeteerInfo = null
+
+  // Clear position swap state
+  room.pendingPositionSwap = null
+  room.positionSwaps       = []
+
+  // Clear pendingAction if it relates to removed specials
+  if (room.pendingAction) {
+    const paType = room.pendingAction.type
+    if (REMOVED_SPECIAL_TYPES.has(paType)) {
+      room.pendingAction = null
+      // If room was stuck in pendingSpecial because of one of these, revert
+      if (room.phase === 'pendingSpecial') room.phase = 'playing'
+    }
+  }
+
+  // Remove removed special effects
+  if (Array.isArray(room.effects)) {
+    room.effects = room.effects.filter(e => !REMOVED_SPECIAL_TYPES.has(e.type))
+  }
+
+  // Ensure mustPassNormalPlayerIdx exists (Task 2)
+  if (room.mustPassNormalPlayerIdx === undefined) {
+    room.mustPassNormalPlayerIdx = -1
+  }
+
+  // Ensure enabledSpecials in settings doesn't contain removed types
+  if (room.settings?.enabledSpecials) {
+    room.settings.enabledSpecials = room.settings.enabledSpecials.filter(
+      t => !REMOVED_SPECIAL_TYPES.has(t)
+    )
+    if (room.settings.enabledSpecials.length === 0) {
+      room.settings.enabledSpecials = SPECIALS.map(s => s.type)
+    }
+  }
+
+  return room
 }
 
 // ── Helpers ──────────────────────────────────────────────────────
@@ -73,8 +137,13 @@ export function buildNormalDeck(playerCount, normalCount = 4) {
   return shuffle(deck)
 }
 
+// TASK 1 — buildSpecialPool never generates PUPPETEER or POSITION_SWAP
 export function buildSpecialPool(playerCount, specialCount = 2, enabledSpecialTypes = SPECIALS.map(s => s.type)) {
-  const allowed = enabledSpecialTypes.length ? enabledSpecialTypes : SPECIALS.map(s => s.type)
+  // Filter out removed types regardless of what caller passes
+  const safeTypes = (enabledSpecialTypes.length ? enabledSpecialTypes : SPECIALS.map(s => s.type))
+    .filter(t => !REMOVED_SPECIAL_TYPES.has(t))
+    .filter(t => SPECIALS.some(s => s.type === t)) // must be valid/known
+  const allowed = safeTypes.length ? safeTypes : SPECIALS.map(s => s.type)
   const pool = []
   for (let i = 0; i < playerCount * specialCount; i++) {
     const type = allowed[Math.floor(Math.random() * allowed.length)]
@@ -97,11 +166,17 @@ export function dealHands(playerCount, mode = 'special', settings = {}) {
 }
 
 // ── Factories ─────────────────────────────────────────────────────
-export function makePlayer(id, name, colorIdx) {
+// TASK 8/9 — makePlayer includes online/bot fields
+export function makePlayer(id, name, colorIdx, { isBot = false } = {}) {
   return {
     id, name, color: colorIdx, score: 0,
     chits: [], isShow: false, frozen: false, stunned: false,
     originalIdx: colorIdx,
+    // Bot/connection tracking
+    online:         !isBot ? true : true,  // bots start online
+    botActive:      isBot,
+    disconnectedAt: null,
+    isBot,
   }
 }
 
@@ -113,14 +188,14 @@ export function makeRoom(code, host) {
     players: [host], showClicks: [],
     frozenPlayer: -1,
     stunnedPlayer: -1,
-    puppeteerInfo: null,
-    positionSwaps: [],
-    pendingPositionSwap: null,
+    // TASK 1 — removed puppeteerInfo, positionSwaps, pendingPositionSwap
     pendingAction: null,
     mode: 'special',
     superVitalsUsed: false,
     effects: [],
     superVitalsAlert: null,
+    // TASK 2 — mustPassNormalPlayerIdx
+    mustPassNormalPlayerIdx: -1,
     settings: {
       normalCount: 4,
       specialCount: 2,
@@ -152,22 +227,10 @@ function makeEffect(type, ownerIdx, targetIdx, trigger, expires, data = {}) {
   return { id: Date.now() + Math.random(), type, ownerIdx, targetIdx, trigger, expires, data }
 }
 
-function getActivePuppeteerEffect(room) {
-  return (room.effects ?? []).find(e => e.type === 'PUPPETEER' && e.targetIdx === room.currentTurn) ?? null
-}
-
 function resolveActorHandOwner(room, action) {
-  if (action.actorIdx != null && action.handOwnerIdx != null) {
-    const ppe = getActivePuppeteerEffect(room)
-    const isPuppeteerControl = ppe != null && ppe.ownerIdx === action.actorIdx && ppe.targetIdx === action.handOwnerIdx
-    return { actorIdx: action.actorIdx, handOwnerIdx: action.handOwnerIdx, isPuppeteerControl }
-  }
-  const ppe = getActivePuppeteerEffect(room)
-  if (ppe) {
-    return { actorIdx: ppe.ownerIdx, handOwnerIdx: ppe.targetIdx, isPuppeteerControl: true }
-  }
-  const idx = action.playerIdx ?? 0
-  return { actorIdx: idx, handOwnerIdx: idx, isPuppeteerControl: false }
+  // TASK 1 — Puppeteer control removed; always use direct actor resolution
+  const idx = action.actorIdx ?? action.playerIdx ?? 0
+  return { actorIdx: idx, handOwnerIdx: action.handOwnerIdx ?? idx, isPuppeteerControl: false }
 }
 
 function hasSpecial(player, type, chitIdx) {
@@ -185,53 +248,7 @@ function validateSpecialUse(room, action, specialType, actorIdx, handOwnerIdx) {
   if (!room.players[handOwnerIdx]) return false
   if (!hasSpecial(room.players[handOwnerIdx], specialType, action.chitIdx)) return false
   if (cfg.timing === 'TURN_ONLY' && handOwnerIdx !== room.currentTurn) return false
-  const ppe = getActivePuppeteerEffect(room)
-  if (ppe && actorIdx === ppe.targetIdx) return false
   return true
-}
-
-function remapIdx(idx, a, b) {
-  if (idx === a) return b
-  if (idx === b) return a
-  return idx
-}
-
-function swapPlayerObjectsAndRefs(room, a, b) {
-  if (a === b || a < 0 || b < 0) return
-  if (!room.players[a] || !room.players[b]) return
-
-  const temp        = room.players[a]
-  room.players[a]   = room.players[b]
-  room.players[b]   = temp
-
-  room.currentTurn   = remapIdx(room.currentTurn,   a, b)
-  room.frozenPlayer  = remapIdx(room.frozenPlayer,   a, b)
-  room.stunnedPlayer = remapIdx(room.stunnedPlayer,  a, b)
-  room.showCaller    = remapIdx(room.showCaller,     a, b)
-
-  if (Array.isArray(room.showClicks)) {
-    room.showClicks = room.showClicks.map(c => ({ ...c, playerIdx: remapIdx(c.playerIdx, a, b) }))
-  }
-  if (room.puppeteerInfo) {
-    room.puppeteerInfo.puppeteerIdx = remapIdx(room.puppeteerInfo.puppeteerIdx, a, b)
-    room.puppeteerInfo.targetIdx    = remapIdx(room.puppeteerInfo.targetIdx,    a, b)
-  }
-  if (room.pendingAction) {
-    if (typeof room.pendingAction.userIdx      === 'number') room.pendingAction.userIdx      = remapIdx(room.pendingAction.userIdx,      a, b)
-    if (typeof room.pendingAction.handOwnerIdx === 'number') room.pendingAction.handOwnerIdx = remapIdx(room.pendingAction.handOwnerIdx, a, b)
-    if (typeof room.pendingAction.targetIdx    === 'number') room.pendingAction.targetIdx    = remapIdx(room.pendingAction.targetIdx,    a, b)
-  }
-  if (room.pendingPositionSwap) {
-    room.pendingPositionSwap.from = remapIdx(room.pendingPositionSwap.from, a, b)
-    room.pendingPositionSwap.to   = remapIdx(room.pendingPositionSwap.to,   a, b)
-  }
-  if (Array.isArray(room.effects)) {
-    room.effects = room.effects.map(e => ({
-      ...e,
-      ownerIdx:  remapIdx(e.ownerIdx,  a, b),
-      targetIdx: remapIdx(e.targetIdx, a, b),
-    }))
-  }
 }
 
 function checkSuperVitals(room) {
@@ -257,29 +274,11 @@ function runEffects(room, trigger, context, log) {
   if (!room.effects) room.effects = []
   const toRemove = []
 
-  if (trigger === 'AFTER_OWNER_NORMAL_PASS') {
-    const { passedPlayerIdx } = context
-    room.effects.forEach(e => {
-      if (e.type === 'POSITION_SWAP' && e.ownerIdx === passedPlayerIdx) {
-        const nameA = room.players[e.ownerIdx]?.name
-        const nameB = room.players[e.targetIdx]?.name
-        const from  = e.ownerIdx
-        const to    = e.targetIdx
-        swapPlayerObjectsAndRefs(room, from, to)
-        room.positionSwaps.push({ from, to })
-        log(`🔀 Positions swapped! ${nameA} ↔ ${nameB}`)
-        toRemove.push(e.id)
-      }
-    })
-  }
+  // TASK 1 — POSITION_SWAP and PUPPETEER effect handling removed
 
   if (trigger === 'AFTER_TARGET_PASS') {
     const { passedPlayerIdx } = context
     room.effects.forEach(e => {
-      if (e.type === 'PUPPETEER' && e.targetIdx === passedPlayerIdx) {
-        room.puppeteerInfo = null
-        toRemove.push(e.id)
-      }
       if (e.type === 'STUN_GRENADE' && e.targetIdx === passedPlayerIdx) {
         room.stunnedPlayer = -1
         if (room.players[passedPlayerIdx]) room.players[passedPlayerIdx].stunned = false
@@ -295,10 +294,76 @@ function runEffects(room, trigger, context, log) {
   room.effects = room.effects.filter(e => !toRemove.includes(e.id))
 }
 
+// ── TASK 10 — remap player indexes after removal ──────────────────
+export function remapPlayerIndexes(room, removedIndexes) {
+  if (!removedIndexes || removedIndexes.length === 0) return
+
+  // Build index mapping: old → new
+  const indexMap = {}
+  let newIdx = 0
+  for (let i = 0; i < room.players.length + removedIndexes.length; i++) {
+    if (!removedIndexes.includes(i)) {
+      indexMap[i] = newIdx++
+    }
+  }
+
+  const remap = idx => (idx === -1 ? -1 : (indexMap[idx] ?? -1))
+
+  room.currentTurn   = remap(room.currentTurn)
+  room.frozenPlayer  = remap(room.frozenPlayer)
+  room.stunnedPlayer = remap(room.stunnedPlayer)
+  room.showCaller    = remap(room.showCaller)
+
+  if (Array.isArray(room.showClicks)) {
+    room.showClicks = room.showClicks
+      .filter(c => !removedIndexes.includes(c.playerIdx))
+      .map(c => ({ ...c, playerIdx: remap(c.playerIdx) }))
+  }
+
+  if (room.pendingAction) {
+    if (typeof room.pendingAction.userIdx      === 'number') room.pendingAction.userIdx      = remap(room.pendingAction.userIdx)
+    if (typeof room.pendingAction.handOwnerIdx === 'number') room.pendingAction.handOwnerIdx = remap(room.pendingAction.handOwnerIdx)
+    if (typeof room.pendingAction.targetIdx    === 'number') room.pendingAction.targetIdx    = remap(room.pendingAction.targetIdx)
+  }
+
+  if (Array.isArray(room.effects)) {
+    room.effects = room.effects.map(e => ({
+      ...e,
+      ownerIdx:  remap(e.ownerIdx),
+      targetIdx: remap(e.targetIdx),
+    }))
+  }
+
+  if (typeof room.mustPassNormalPlayerIdx === 'number') {
+    room.mustPassNormalPlayerIdx = remap(room.mustPassNormalPlayerIdx)
+  }
+}
+
+// ── TASK 10 — removeDisconnectedBots ─────────────────────────────
+// Called at ROUND_END to remove bot-takeover players who never returned.
+export function removeDisconnectedBots(room) {
+  // Find players who are offline, have bot active, and are NOT a permanent bot
+  const toRemove = []
+  room.players.forEach((p, i) => {
+    if (!p.online && p.botActive && !p.isBot) {
+      toRemove.push(i)
+    }
+  })
+
+  if (toRemove.length === 0) return room
+
+  remapPlayerIndexes(room, toRemove)
+  room.players = room.players.filter((_, i) => !toRemove.includes(i))
+
+  return room
+}
+
 // ── Pure reducer ──────────────────────────────────────────────────
 export function applyAction(room, logs, action) {
   const r  = JSON.parse(JSON.stringify(room))
   if (!r.effects) r.effects = []
+  // Ensure mustPassNormalPlayerIdx exists
+  if (r.mustPassNormalPlayerIdx === undefined) r.mustPassNormalPlayerIdx = -1
   const lg = [...logs]
   const log = m => lg.unshift(m)
 
@@ -322,7 +387,7 @@ export function applyAction(room, logs, action) {
       const { enabledSpecials } = action
       if (!Array.isArray(enabledSpecials) || enabledSpecials.length === 0) break
       const validTypes = SPECIALS.map(s => s.type)
-      const filtered   = enabledSpecials.filter(t => validTypes.includes(t))
+      const filtered   = enabledSpecials.filter(t => validTypes.includes(t) && !REMOVED_SPECIAL_TYPES.has(t))
       if (filtered.length === 0) break
       if (!r.settings) r.settings = {}
       r.settings.enabledSpecials = filtered
@@ -334,13 +399,18 @@ export function applyAction(room, logs, action) {
       r.players = r.players.map((p, i) => ({
         ...p, chits: hands[i], isShow: false,
         frozen: false, stunned: false, originalIdx: i,
+        online: p.online ?? true, botActive: p.isBot ? true : (p.botActive ?? false),
+        disconnectedAt: null,
       }))
       r.phase = 'playing'; r.round = 1; r.currentTurn = 0
       r.direction = 1; r.showCaller = -1; r.showClicks = []
       r.frozenPlayer = -1; r.stunnedPlayer = -1
-      r.puppeteerInfo = null; r.positionSwaps = []; r.pendingAction = null
-      r.pendingPositionSwap = null; r.superVitalsUsed = false
+      // TASK 1 — removed puppeteerInfo, positionSwaps, pendingPositionSwap
+      r.pendingAction = null
+      r.superVitalsUsed = false
       r.effects = []; r.superVitalsAlert = null; r.roundResults = null
+      // TASK 2 — reset mustPassNormalPlayerIdx
+      r.mustPassNormalPlayerIdx = -1
       log(`Round 1 started! ${r.players[0].name}'s turn.`)
       break
     }
@@ -349,6 +419,12 @@ export function applyAction(room, logs, action) {
       const { handOwnerIdx } = resolveActorHandOwner(r, action)
       const pi = handOwnerIdx
       if (pi !== r.currentTurn) break
+
+      // TASK 2 — enforce mustPassNormal on server
+      if (r.mustPassNormalPlayerIdx === pi) {
+        const chit = r.players[pi].chits[action.chitIdx]
+        if (!chit || isSpecial(chit)) break // must pass a normal card
+      }
 
       const ni = nextPlayer(r, pi, r.frozenPlayer !== -1)
       const [chit] = r.players[pi].chits.splice(action.chitIdx, 1)
@@ -359,15 +435,15 @@ export function applyAction(room, logs, action) {
       r.players.forEach(p => { p.frozen = false })
       r.effects = r.effects.filter(e => e.type !== 'FREEZE')
 
+      // TASK 2 — clear mustPassNormal after successful pass
+      if (r.mustPassNormalPlayerIdx === pi) {
+        r.mustPassNormalPlayerIdx = -1
+      }
+
       log(`${r.players[pi].name} passed a chit to ${r.players[ni].name}.`)
 
-      runEffects(r, 'AFTER_OWNER_NORMAL_PASS', { passedPlayerIdx: pi }, log)
-      runEffects(r, 'AFTER_TARGET_PASS',        { passedPlayerIdx: pi }, log)
-      runEffects(r, 'AFTER_CARD_CHANGE',         {},                     log)
-
-      if (r.puppeteerInfo && !r.puppeteerInfo.active && r.puppeteerInfo.targetIdx === r.currentTurn) {
-        r.puppeteerInfo = { ...r.puppeteerInfo, active: true }
-      }
+      runEffects(r, 'AFTER_TARGET_PASS', { passedPlayerIdx: pi }, log)
+      runEffects(r, 'AFTER_CARD_CHANGE', {},                      log)
       break
     }
 
@@ -409,6 +485,8 @@ export function applyAction(room, logs, action) {
       r.pendingAction = { type: 'BLIND_SNATCH', userIdx: actorIdx, handOwnerIdx }
       r.phase = 'pendingSpecial'
       log(`🎲 ${r.players[actorIdx].name} plays Blind Snatch!`)
+      // TASK 2 — after snatch the player must pass a normal
+      r.mustPassNormalPlayerIdx = actorIdx
       break
     }
 
@@ -444,6 +522,8 @@ export function applyAction(room, logs, action) {
       r.pendingAction = { type: 'REVEALED_SNATCH', userIdx: actorIdx, handOwnerIdx }
       r.phase = 'pendingSpecial'
       log(`👁 ${r.players[actorIdx].name} plays Revealed Snatch!`)
+      // TASK 2 — after snatch the player must pass a normal
+      r.mustPassNormalPlayerIdx = actorIdx
       break
     }
 
@@ -523,46 +603,13 @@ export function applyAction(room, logs, action) {
       break
     }
 
-    case 'USE_PUPPETEER': {
-      const { actorIdx, handOwnerIdx } = resolveActorHandOwner(r, action)
-      if (!validateSpecialUse(r, action, 'PUPPETEER', actorIdx, handOwnerIdx)) break
-      consumeSpecial(r, handOwnerIdx, 'PUPPETEER', action.chitIdx)
-      r.pendingAction = { type: 'PUPPETEER', userIdx: actorIdx, handOwnerIdx }
-      r.phase = 'pendingSpecial'
-      log(`🎭 ${r.players[actorIdx].name} plays Puppeteer!`)
-      break
-    }
-
-    case 'PUPPETEER_PICK': {
-      const { userIdx } = r.pendingAction
-      const targetIdx   = action.targetIdx
-      const nextIdx     = nextPlayer(r, r.currentTurn)
-      if (targetIdx === userIdx || targetIdx === nextIdx) break
-      r.puppeteerInfo = { puppeteerIdx: userIdx, targetIdx, active: false }
-      r.effects.push(makeEffect('PUPPETEER', userIdx, targetIdx, 'ON_TARGET_TURN', 'AFTER_TARGET_PASS'))
-      r.pendingAction = null; r.phase = 'playing'
-      log(`🎭 ${r.players[userIdx].name} will control ${r.players[targetIdx].name} on their next turn!`)
-      break
-    }
-
-    case 'USE_POSITION_SWAP': {
-      const { actorIdx, handOwnerIdx } = resolveActorHandOwner(r, action)
-      if (!validateSpecialUse(r, action, 'POSITION_SWAP', actorIdx, handOwnerIdx)) break
-      consumeSpecial(r, handOwnerIdx, 'POSITION_SWAP', action.chitIdx)
-      r.pendingAction = { type: 'POSITION_SWAP', userIdx: actorIdx, handOwnerIdx }
-      r.phase = 'pendingSpecial'
-      log(`🔀 ${r.players[actorIdx].name} plays Position Swap!`)
-      break
-    }
-
+    // TASK 1 — USE_PUPPETEER, PUPPETEER_PICK, USE_POSITION_SWAP, POSITION_SWAP_PICK
+    // are intentionally removed. If old clients send these, we silently ignore.
+    case 'USE_PUPPETEER':
+    case 'PUPPETEER_PICK':
+    case 'USE_POSITION_SWAP':
     case 'POSITION_SWAP_PICK': {
-      const { userIdx, handOwnerIdx } = r.pendingAction
-      const targetIdx  = action.targetIdx
-      const ownerIdx   = handOwnerIdx ?? userIdx
-      r.effects.push(makeEffect('POSITION_SWAP', ownerIdx, targetIdx, 'AFTER_OWNER_NORMAL_PASS', 'ONCE'))
-      r.pendingPositionSwap = null
-      r.pendingAction = null; r.phase = 'playing'
-      log(`🔀 ${r.players[ownerIdx].name} set up a position swap with ${r.players[targetIdx].name} — pass a chit to trigger!`)
+      // Do nothing — these cards are removed
       break
     }
 
@@ -629,16 +676,13 @@ export function applyAction(room, logs, action) {
     }
 
     case 'ROUND_END': {
-      if (r.positionSwaps.length > 0) {
-        ;[...r.positionSwaps].reverse().forEach(({ from, to }) => {
-          const tmp     = r.players[from]
-          r.players[from] = r.players[to]
-          r.players[to]   = tmp
-        })
-      }
-      r.pendingPositionSwap = null
+      // TASK 1 — positionSwaps unwind removed
+      // TASK 10 — remove disconnected bot-takeover players
+      removeDisconnectedBots(r)
       r.effects = r.effects.filter(e => e.expires !== 'ROUND_END')
       r.superVitalsAlert = null
+      // TASK 2 — reset mustPassNormal
+      r.mustPassNormalPlayerIdx = -1
       r.phase = 'roundEnd'; break
     }
 
@@ -646,19 +690,25 @@ export function applyAction(room, logs, action) {
       const hands = dealHands(r.players.length, r.mode, r.settings)
       r.players = r.players.map((p, i) => ({
         ...p, chits: hands[i], isShow: false, frozen: false, stunned: false,
+        botActive: p.isBot ? true : false,
+        disconnectedAt: null,
       }))
       r.phase = 'playing'; r.round += 1; r.currentTurn = 0
       r.direction = 1; r.showCaller = -1; r.showClicks = []
       r.frozenPlayer = -1; r.stunnedPlayer = -1
-      r.puppeteerInfo = null; r.positionSwaps = []; r.pendingAction = null
-      r.pendingPositionSwap = null; r.superVitalsUsed = false
+      // TASK 1 — removed puppeteerInfo, positionSwaps, pendingPositionSwap
+      r.pendingAction = null
+      r.superVitalsUsed = false
       r.effects = []; r.superVitalsAlert = null; r.roundResults = null
+      // TASK 2 — reset mustPassNormal
+      r.mustPassNormalPlayerIdx = -1
       log('─── Round ' + r.round + ' started! ' + r.players[0].name + "'s turn. ───")
       break
     }
 
     case 'END_GAME': {
       r.phase = 'ended'
+      r.mustPassNormalPlayerIdx = -1
       const w = [...r.players].sort((a, b) => b.score - a.score)[0]
       log('🏆 Game over! ' + w.name + ' wins with ' + w.score + ' pts!')
       break
@@ -667,13 +717,17 @@ export function applyAction(room, logs, action) {
     case 'PLAY_AGAIN': {
       r.players = r.players.map(p => ({
         ...p, score: 0, chits: [], isShow: false, frozen: false, stunned: false,
+        botActive: p.isBot ? true : false, disconnectedAt: null,
       }))
       r.phase = 'lobby'; r.round = 1; r.currentTurn = 0
       r.direction = 1; r.showCaller = -1; r.showClicks = []
       r.frozenPlayer = -1; r.stunnedPlayer = -1
-      r.puppeteerInfo = null; r.positionSwaps = []; r.pendingAction = null
-      r.pendingPositionSwap = null; r.superVitalsUsed = false
+      // TASK 1 — removed puppeteerInfo, positionSwaps, pendingPositionSwap
+      r.pendingAction = null
+      r.superVitalsUsed = false
       r.effects = []; r.superVitalsAlert = null; r.roundResults = null
+      // TASK 2 — reset mustPassNormal
+      r.mustPassNormalPlayerIdx = -1
       break
     }
   }
@@ -682,18 +736,26 @@ export function applyAction(room, logs, action) {
 }
 
 // ── Server wrapper — resolves playerIdx from authenticated playerId ──
+// TASK 3 — returns { room, logs, error } always
 export function applyServerAction(room, logs, action, playerId) {
-  const playerIdx = room.players.findIndex(p => p.id === playerId)
-  if (playerIdx === -1) {
-    return { room, logs, error: 'Player not in room' }
+  // Special system actions that don't require a player match
+  const systemActions = new Set(['SHOW_RESOLVE', 'ROUND_END'])
+  if (!systemActions.has(action.type)) {
+    const playerIdx = room.players.findIndex(p => p.id === playerId)
+    if (playerIdx === -1) {
+      return { room, logs, error: 'Player not in room' }
+    }
+
+    const safeAction = {
+      ...action,
+      actorIdx:     playerIdx,
+      playerIdx:    action.playerIdx    ?? playerIdx,
+      handOwnerIdx: action.handOwnerIdx ?? action.playerIdx ?? playerIdx,
+    }
+
+    return applyAction(room, logs, safeAction)
   }
 
-  const safeAction = {
-    ...action,
-    actorIdx:     playerIdx,
-    playerIdx:    action.playerIdx    ?? playerIdx,
-    handOwnerIdx: action.handOwnerIdx ?? action.playerIdx ?? playerIdx,
-  }
-
-  return applyAction(room, logs, safeAction)
+  // System actions (timers etc.) — apply directly
+  return applyAction(room, logs, action)
 }
