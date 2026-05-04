@@ -45,6 +45,12 @@ export function sanitizeRoom(room) {
           return true
         })
       }
+      // Backfill stable chit ids for cards from old rooms that pre-date the id field
+      if (Array.isArray(p.chits)) {
+        p.chits.forEach((c, i) => {
+          if (c && !c.id) c.id = chitId()
+        })
+      }
       // Ensure bot/online fields always exist (Task 8/9)
       if (p.online        === undefined) p.online        = true
       if (p.botActive     === undefined) p.botActive     = false
@@ -97,12 +103,15 @@ export function sanitizeRoom(room) {
 export function isSpecial(chit) {
   return chit && typeof chit === 'object' && chit.special === true
 }
+let _chitSeq = 0
+function chitId() { return `c${Date.now()}_${++_chitSeq}` }
+
 export function makeNormalChit(symbol) {
-  return { symbol, special: false }
+  return { id: chitId(), symbol, special: false }
 }
 export function makeSpecialChit(type) {
   const def = SPECIALS.find(s => s.type === type) ?? SPECIALS[0]
-  return { type, emoji: def.emoji, name: def.name, special: true }
+  return { id: chitId(), type, emoji: def.emoji, name: def.name, special: true }
 }
 export function isShowHand(chits = [], requiredSets = 1) {
   const normals = chits.filter(c => !isSpecial(c))

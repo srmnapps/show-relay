@@ -24,7 +24,7 @@ await redis.connect()
 
 // ── Redis helpers (Task 5) ────────────────────────────────────────
 const ROOM_TTL        = 60 * 60 * 6  // 6 hours (active rooms)
-const EMPTY_LOBBY_TTL = 60 * 2       // 2 minutes (empty lobbies)
+const EMPTY_LOBBY_TTL = 15             // 15 seconds (empty lobbies)
 
 function roomKey(code) { return `room:${code}` }
 function logsKey(code) { return `room:${code}:logs` }
@@ -770,16 +770,32 @@ wss.on('connection', (ws) => {
           const entry = await loadRoom(roomCode)
           if (!entry) return
 
-          if (mem.clients.size > 0) {
-            broadcastState(roomCode, entry.room, entry.logs)
-            if (entry.isPublic) broadcastRoomsList()
-          } else if (entry.room.phase === 'lobby') {
-            // Issue 3 — if no real humans remain online in lobby, delete immediately
-            if (getOnlineHumanCount(entry.room) === 0) {
+          if (entry.room.phase === 'lobby') {
+            // Fix 4 — remove the player who explicitly left
+            const leavingIdx = entry.room.players.findIndex(p => p.id === playerId && !p.isBot)
+            if (leavingIdx !== -1) {
+              entry.room.players.splice(leavingIdx, 1)
+              // Re-assign hostId if the host left
+              if (entry.room.hostId === playerId) {
+                entry.room = transferHost(entry.room)
+              }
+            }
+
+            if (getOnlineHumanCount(entry.room) === 0 || entry.room.players.filter(p => !p.isBot).length === 0) {
+              // No real humans left — delete immediately
+              cancelRoomCleanup(roomCode)
               await deleteEmptyLobbyNow(roomCode)
             } else {
-              // Still humans online; set short TTL as a safety net
-              await saveRoom(roomCode, entry, EMPTY_LOBBY_TTL)
+              await saveRoom(roomCode, entry)
+              if (mem.clients.size > 0) {
+                broadcastState(roomCode, entry.room, entry.logs)
+              }
+              if (entry.isPublic) broadcastRoomsList()
+            }
+          } else {
+            if (mem.clients.size > 0) {
+              broadcastState(roomCode, entry.room, entry.logs)
+              if (entry.isPublic) broadcastRoomsList()
             }
           }
         } catch (err) {
@@ -843,7 +859,7 @@ wss.on('connection', (ws) => {
             scheduleBotTurn(roomCode, playerIdx, 800)
           }
         } else if (entry.room.phase === 'lobby') {
-          // In lobby: mark offline; immediately delete if no real humans remain
+          // In lobby: mark offline
           player.online = false
 
           // Task 7 — host transfer in lobby too
@@ -851,9 +867,11 @@ wss.on('connection', (ws) => {
             entry.room = transferHost(entry.room)
           }
 
-          // Issue 3 — delete immediately if no real humans online in lobby
+          // Fix 4 — If no real humans remain online, schedule 15-second cleanup.
+          // (A reconnect within 15s cancels the timer via cancelRoomCleanup.)
           if (getOnlineHumanCount(entry.room) === 0) {
-            await deleteEmptyLobbyNow(roomCode)
+            await saveRoom(roomCode, entry)
+            scheduleRoomCleanup(roomCode)
           } else {
             await saveRoom(roomCode, entry)
             if (mem.clients.size > 0) {
