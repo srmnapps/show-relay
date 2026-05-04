@@ -748,6 +748,29 @@ wss.on('connection', (ws) => {
 
           broadcastState(roomCode, result.room, result.logs)
 
+          // ── SOUND_EVENT broadcasts ─────────────────────────────
+          const SOUND_ACTION_MAP = {
+            PASS:                'cardPass',
+            USE_REVERSE:         'specialReverse',
+            USE_FREEZE:          'specialFreeze',
+            USE_BLIND_SNATCH:    'specialBlindSnatch',
+            USE_REVEALED_SNATCH: 'specialRevealedSnatch',
+            USE_STUN_GRENADE:    'specialStunGrenade',
+            USE_VITALS:          'specialVitals',
+            USE_SUPER_VITALS:    'specialSuperVitals',
+            USE_NUKE:            'specialNuke',
+          }
+          const soundName = SOUND_ACTION_MAP[action.type]
+          if (soundName) {
+            broadcastToRoom(roomCode, {
+              type:       'SOUND_EVENT',
+              sound:      soundName,
+              roomCode,
+              byPlayerId: playerId,
+              id:         `${action.type}_${Date.now()}_${Math.random().toString(36).slice(2,7)}`,
+            })
+          }
+
           // Schedule bot turn if needed (Task 8/9)
           maybeScheduleBotTurn(roomCode, result.room)
         } catch (err) {
