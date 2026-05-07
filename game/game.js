@@ -476,6 +476,7 @@ export function applyAction(room, logs, action) {
     }
 
     case 'FREEZE_PICK': {
+      if (!r.pendingAction) break
       const { userIdx } = r.pendingAction
       const targetIdx   = action.targetIdx
       r.frozenPlayer    = targetIdx
@@ -500,6 +501,7 @@ export function applyAction(room, logs, action) {
     }
 
     case 'BLIND_SNATCH_PICK': {
+      if (!r.pendingAction) break
       const { userIdx } = r.pendingAction
       const targetIdx   = action.targetIdx
       r.pendingAction = { ...r.pendingAction, targetIdx }
@@ -509,6 +511,7 @@ export function applyAction(room, logs, action) {
     }
 
     case 'BLIND_SNATCH_PICK_CARD': {
+      if (!r.pendingAction) break
       const { userIdx, handOwnerIdx: hoIdx, targetIdx } = r.pendingAction
       const ho  = hoIdx ?? userIdx
       const tci = action.targetCardIdx
@@ -537,6 +540,7 @@ export function applyAction(room, logs, action) {
     }
 
     case 'REVEALED_SNATCH_PICK_TARGET': {
+      if (!r.pendingAction) break
       const { userIdx } = r.pendingAction
       const targetIdx   = action.targetIdx
       const normals     = r.players[targetIdx].chits
@@ -549,6 +553,7 @@ export function applyAction(room, logs, action) {
     }
 
     case 'REVEALED_SNATCH_PICK_CHIT': {
+      if (!r.pendingAction) break
       const { userIdx, handOwnerIdx: hoIdx, targetIdx } = r.pendingAction
       const ho  = hoIdx ?? userIdx
       const tci = action.targetCardIdx ?? action.chitIdx
@@ -575,6 +580,7 @@ export function applyAction(room, logs, action) {
     }
 
     case 'STUN_GRENADE_PICK': {
+      if (!r.pendingAction) break
       const { userIdx } = r.pendingAction
       const targetIdx   = action.targetIdx
       r.stunnedPlayer   = targetIdx
@@ -596,6 +602,7 @@ export function applyAction(room, logs, action) {
     }
 
     case 'NUKE_PICK_TARGET': {
+      if (!r.pendingAction) break
       const targetIdx   = action.targetIdx
       r.pendingAction   = { ...r.pendingAction, targetIdx, step: 'pickingCard' }
       r.phase = 'nukePicking'
@@ -603,6 +610,7 @@ export function applyAction(room, logs, action) {
     }
 
     case 'NUKE_PICK_CARD': {
+      if (!r.pendingAction) break
       const { userIdx, targetIdx } = r.pendingAction
       const card = r.players[targetIdx]?.chits[action.chitIdx]
       if (!card || !isSpecial(card)) break

@@ -1,6 +1,8 @@
 // show-relay/server.js
 // Server-authoritative + Redis persistence + public/private rooms (ESM)
-// Tasks 1-14 fully implemented
+// Merged: V2 base (host.online=true, newPlayer.online=true, full logging,
+//         roundResult/show/gameEnd SOUND_EVENTs) +
+//         V1 fix: rejoin:true awareness + yourTurn SOUND_EVENT (new feature)
 
 import 'dotenv/config'
 import { WebSocketServer } from 'ws'
@@ -22,7 +24,7 @@ redis.on('reconnecting', () => console.log('[Redis] reconnecting…'))
 
 await redis.connect()
 
-// ── Redis helpers (Task 5) ────────────────────────────────────────
+// ── Redis helpers ─────────────────────────────────────────────────
 const ROOM_TTL        = 60 * 60 * 6  // 6 hours (active rooms)
 const EMPTY_LOBBY_TTL = 15             // 15 seconds (empty lobbies)
 
@@ -64,9 +66,9 @@ async function deleteRoom(code) {
 }
 
 // ── Track all active public room codes in a Redis Set ─────────────
-async function addPublicRoom(code) { await redis.sAdd('public_rooms', code) }
+async function addPublicRoom(code)    { await redis.sAdd('public_rooms', code) }
 async function removePublicRoom(code) { await redis.sRem('public_rooms', code) }
-async function getPublicRoomCodes() { return redis.sMembers('public_rooms') }
+async function getPublicRoomCodes()   { return redis.sMembers('public_rooms') }
 
 // ── In-memory room entries ────────────────────────────────────────
 // entries: Map<roomCode, { clients: Set<WebSocket>, timers: {}, cleanupTimer }>
@@ -88,12 +90,9 @@ function generateRoomCode() {
 }
 
 async function uniqueRoomCode() {
-  let code = generateRoomCode()
+  let code   = generateRoomCode()
   let exists = await redis.exists(roomKey(code))
-  while (exists) {
-    code = generateRoomCode()
-    exists = await redis.exists(roomKey(code))
-  }
+  while (exists) { code = generateRoomCode(); exists = await redis.exists(roomKey(code)) }
   return code
 }
 
@@ -103,21 +102,26 @@ function sendTo(ws, payload) {
 
 function broadcastToRoom(code, payload) {
   const msg = JSON.stringify(payload)
-  getEntry(code).clients.forEach(ws => {
-    if (ws.readyState === 1) ws.send(msg)
-  })
+  getEntry(code).clients.forEach(ws => { if (ws.readyState === 1) ws.send(msg) })
 }
 
-// Task 13 — broadcast order: sanitize → save → broadcast
 function broadcastState(code, room, logs) {
   broadcastToRoom(code, { type: 'STATE_SYNC', payload: room, logs })
 }
 
 function sendToPlayer(code, playerId, payload) {
   getEntry(code).clients.forEach(ws => {
-    if (ws.playerId === playerId && ws.readyState === 1) {
-      ws.send(JSON.stringify(payload))
-    }
+    if (ws.playerId === playerId && ws.readyState === 1) ws.send(JSON.stringify(payload))
+  })
+}
+
+// ── Sound event helper ────────────────────────────────────────────
+function broadcastSound(code, sound, extra = {}) {
+  broadcastToRoom(code, {
+    type:  'SOUND_EVENT',
+    sound,
+    ...extra,
+    id: `${sound}_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
   })
 }
 
@@ -137,7 +141,7 @@ function buildRoomSummary(code, room, meta) {
 // ── Broadcast updated public room list to ALL connected clients ────
 async function broadcastRoomsList() {
   try {
-    const codes = await getPublicRoomCodes()
+    const codes     = await getPublicRoomCodes()
     const summaries = []
     for (const code of codes) {
       const data = await loadRoom(code)
@@ -153,26 +157,14 @@ async function broadcastRoomsList() {
   }
 }
 
-// ── Issue 3 — helpers ─────────────────────────────────────────────
-/**
- * Returns the number of real human players who are currently online.
- * Bots and offline humans are excluded.
- */
+// ── Helpers ───────────────────────────────────────────────────────
 function getOnlineHumanCount(room) {
   return room.players.filter(p => p.isBot !== true && p.online === true).length
 }
 
-/**
- * Immediately delete a lobby room from memory and Redis.
- * Only call this when room.phase === 'lobby' and no humans are online.
- */
 async function deleteEmptyLobbyNow(code) {
   const entry = getEntry(code)
-  // Cancel any pending cleanup timer before deleting
-  if (entry.cleanupTimer) {
-    clearTimeout(entry.cleanupTimer)
-    entry.cleanupTimer = null
-  }
+  if (entry.cleanupTimer) { clearTimeout(entry.cleanupTimer); entry.cleanupTimer = null }
   console.log(`[CLEANUP] Immediately deleting empty lobby ${code}`)
   try {
     await deleteRoom(code)
@@ -181,28 +173,20 @@ async function deleteEmptyLobbyNow(code) {
     console.error('[deleteEmptyLobbyNow] Redis error:', err)
   }
   entries.delete(code)
-  // Broadcast updated public list so clients see it disappear immediately
   broadcastRoomsList()
 }
 
-// ── Task 6 — Empty lobby cleanup ──────────────────────────────────
-// Note: for active games we still schedule a 2-minute deferred cleanup
-// (handled in the disconnect handler). This function is only used as a
-// fallback for edge cases where we can't delete immediately.
 function scheduleRoomCleanup(code) {
   const entry = getEntry(code)
-  if (entry.cleanupTimer) return // already scheduled
-  console.log(`[CLEANUP] Scheduling empty-lobby cleanup for ${code} in 2min`)
+  if (entry.cleanupTimer) return
+  console.log(`[CLEANUP] Scheduling empty-lobby cleanup for ${code} in ${EMPTY_LOBBY_TTL}s`)
   entry.cleanupTimer = setTimeout(async () => {
     entry.cleanupTimer = null
-    // Double-check: still no clients?
     if (entry.clients.size > 0) return
     try {
       const data = await loadRoom(code)
       if (!data) return
-      const hasOnline = data.room.players.some(p => p.online)
-      if (hasOnline && entry.clients.size > 0) return
-      // Only clean up if still in lobby
+      if (data.room.players.some(p => p.online) && entry.clients.size > 0) return
       if (data.room.phase !== 'lobby') return
       console.log(`[CLEANUP] Deleting empty lobby ${code}`)
       await deleteRoom(code)
@@ -224,13 +208,12 @@ function cancelRoomCleanup(code) {
   }
 }
 
-// ── Task 7 — Host transfer ────────────────────────────────────────
+// ── Host transfer ─────────────────────────────────────────────────
 function transferHost(room) {
   if (!room.players || room.players.length === 0) return room
   const currentHost = room.players.find(p => p.id === room.hostId)
-  if (currentHost && currentHost.online) return room // host still online, no transfer
+  if (currentHost && currentHost.online) return room
 
-  // Find another online human player
   const newHost = room.players.find(p => p.id !== room.hostId && p.online && !p.isBot)
     ?? room.players.find(p => p.id !== room.hostId && p.online)
 
@@ -241,64 +224,39 @@ function transferHost(room) {
   return room
 }
 
-// ── Task 8 — Bot takeover helpers ─────────────────────────────────
-// ── Smart bot card picker (Bot Intelligence Rule) ─────────────
+// ── Bot card picker ───────────────────────────────────────────────
 function pickBotCard(room, playerIdx) {
   const player = room.players[playerIdx]
-  if (!player || !player.chits || player.chits.length === 0) return null
+  if (!player?.chits?.length) return null
 
-  const chits = player.chits
-
-  // Gather normal cards with their original indices
-  const normalCards = chits.reduce((acc, c, i) => {
+  const normalCards = player.chits.reduce((acc, c, i) => {
     if (!isSpecial(c)) acc.push({ i, symbol: c.symbol })
     return acc
   }, [])
 
-  // Must-pass-normal mode: pick least-useful normal
   if (room.mustPassNormalPlayerIdx === playerIdx) {
-    if (normalCards.length > 0) return chooseLeastUsefulNormal(normalCards)
-    // No normal cards — fallback to any card
-    return Math.floor(Math.random() * chits.length)
+    return normalCards.length > 0
+      ? chooseLeastUsefulNormal(normalCards)
+      : Math.floor(Math.random() * player.chits.length)
   }
-
-  // No normal cards at all: pass any card
-  if (normalCards.length === 0) {
-    return Math.floor(Math.random() * chits.length)
-  }
-
-  // Pass least-useful normal card (keep strongest group)
+  if (normalCards.length === 0) return Math.floor(Math.random() * player.chits.length)
   return chooseLeastUsefulNormal(normalCards)
 }
 
-/**
- * Given an array of { i, symbol } normal cards,
- * return the original index of the card from the weakest symbol group.
- * Keeps the strongest/most-matched group intact.
- */
 function chooseLeastUsefulNormal(normalCards) {
-  // Count by symbol
   const counts = {}
   normalCards.forEach(({ symbol }) => { counts[symbol] = (counts[symbol] || 0) + 1 })
-
-  const maxCount = Math.max(...Object.values(counts))
-
-  // Candidates: cards NOT in the dominant symbol group
-  // (avoid passing cards from the group with the highest count)
+  const maxCount  = Math.max(...Object.values(counts))
   const dominated = Object.keys(counts).filter(s => counts[s] === maxCount)
   const weakCards = normalCards.filter(c => !dominated.includes(c.symbol))
-
-  const pool = weakCards.length > 0 ? weakCards : normalCards
+  const pool      = weakCards.length > 0 ? weakCards : normalCards
   return pool[Math.floor(Math.random() * pool.length)].i
 }
 
+// ── Bot turn scheduler ────────────────────────────────────────────
 async function scheduleBotTurn(code, playerIdx, delayMs = 800) {
   const entry = getEntry(code)
-  // Clear any existing bot turn timer
-  if (entry.timers.botTurn) {
-    clearTimeout(entry.timers.botTurn)
-    entry.timers.botTurn = null
-  }
+  if (entry.timers.botTurn) { clearTimeout(entry.timers.botTurn); entry.timers.botTurn = null }
 
   entry.timers.botTurn = setTimeout(async () => {
     entry.timers.botTurn = null
@@ -306,19 +264,15 @@ async function scheduleBotTurn(code, playerIdx, delayMs = 800) {
       const data = await loadRoom(code)
       if (!data) return
       const { room, logs } = data
-      // Verify it's still this bot's turn
       if (room.currentTurn !== playerIdx) return
       const player = room.players[playerIdx]
-      if (!player) return
-      if (!player.botActive && !player.isBot) return
-      if (room.phase !== 'playing') return
+      if (!player || (!player.botActive && !player.isBot) || room.phase !== 'playing') return
 
-      // Check if bot can call SHOW before passing
       const requiredShowSets = room.settings?.normalCount === 8 ? 2 : 1
-      const botCanShow = isShowHand(player.chits, requiredShowSets)
-
-      const botPlayerId = player.id
+      const botCanShow       = isShowHand(player.chits, requiredShowSets)
+      const botPlayerId      = player.id
       let result
+
       if (botCanShow) {
         result = applyServerAction(room, logs, { type: 'SHOW', playerIdx, timestamp: Date.now() }, botPlayerId)
         if (!result.error) {
@@ -326,30 +280,34 @@ async function scheduleBotTurn(code, playerIdx, delayMs = 800) {
           sanitizeRoom(result.room)
           await saveRoom(code, { ...data, room: result.room, logs: result.logs })
           broadcastState(code, result.room, result.logs)
-          // Schedule SHOW resolve
+          broadcastSound(code, 'show')
           scheduleShowResolve(code, 5000)
           return
         }
-        // SHOW failed — fall through to PASS
       }
 
       const chitIdx = pickBotCard(room, playerIdx)
       if (chitIdx === null) return
 
       result = applyServerAction(room, logs, { type: 'PASS', chitIdx }, botPlayerId)
-      if (result.error) {
-        console.error(`[BOT] ${code} player ${playerIdx} error:`, result.error)
-        return
-      }
+      if (result.error) { console.error(`[BOT] ${code} player ${playerIdx} error:`, result.error); return }
 
       sanitizeRoom(result.room)
-      const entry2 = getEntry(code)
       await saveRoom(code, { ...data, room: result.room, logs: result.logs })
       broadcastState(code, result.room, result.logs)
+      broadcastSound(code, 'cardPass')
 
-      // Schedule next bot turn if it's another bot
-      const nextTurn = result.room.currentTurn
+      // Broadcast yourTurn sound to the next player if they are human
+      const nextTurn   = result.room.currentTurn
       const nextPlayer = result.room.players[nextTurn]
+      if (nextPlayer && !nextPlayer.isBot && !nextPlayer.botActive && nextPlayer.online && result.room.phase === 'playing') {
+        sendToPlayer(code, nextPlayer.id, {
+          type:  'SOUND_EVENT',
+          sound: 'yourTurn',
+          id:    `yourTurn_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+        })
+      }
+      // Schedule next bot turn if it's another bot
       if (nextPlayer && (nextPlayer.botActive || nextPlayer.isBot) && result.room.phase === 'playing') {
         scheduleBotTurn(code, nextTurn, 800)
       }
@@ -362,22 +320,17 @@ async function scheduleBotTurn(code, playerIdx, delayMs = 800) {
 function maybeScheduleBotTurn(code, room) {
   if (room.phase !== 'playing') return
   const currentPlayer = room.players[room.currentTurn]
-  if (!currentPlayer) return
-  if (currentPlayer.botActive || currentPlayer.isBot) {
+  if (currentPlayer?.botActive || currentPlayer?.isBot) {
     scheduleBotTurn(code, room.currentTurn, 800)
   }
 }
 
 function clearBotTimer(code) {
   const entry = getEntry(code)
-  if (entry.timers.botTurn) {
-    clearTimeout(entry.timers.botTurn)
-    entry.timers.botTurn = null
-  }
+  if (entry.timers.botTurn) { clearTimeout(entry.timers.botTurn); entry.timers.botTurn = null }
 }
 
-// ── SHOW timer ─────────────────────────────────────────────────────
-// Task 12 — with timer restore support
+// ── SHOW timer ────────────────────────────────────────────────────
 function scheduleShowResolve(code, remainingMs = 5000) {
   const entry = getEntry(code)
   clearTimeout(entry.timers.showResolve)
@@ -385,7 +338,7 @@ function scheduleShowResolve(code, remainingMs = 5000) {
 
   entry.timers.showResolve = setTimeout(async () => {
     try {
-      const data = await loadRoom(code)
+      const data     = await loadRoom(code)
       if (!data) return
       const callerId = data.room.players[data.room.showCaller]?.id
       const result   = applyServerAction(data.room, data.logs, { type: 'SHOW_RESOLVE' }, callerId)
@@ -393,6 +346,7 @@ function scheduleShowResolve(code, remainingMs = 5000) {
       sanitizeRoom(result.room)
       await saveRoom(code, { ...data, room: result.room, logs: result.logs })
       broadcastState(code, result.room, result.logs)
+      broadcastSound(code, 'roundResult')
 
       entry.timers.roundEnd = setTimeout(async () => {
         try {
@@ -410,20 +364,13 @@ function scheduleShowResolve(code, remainingMs = 5000) {
   }, Math.max(0, remainingMs))
 }
 
-// ── Task 12 — Restore timers on Redis load ─────────────────────────
+// ── Restore timers on Redis load ──────────────────────────────────
 function restoreTimersAfterLoad(code, room) {
-  // Restore SHOW timer
   if (room.phase === 'showWindow' && room.showWindowEnd) {
     const remaining = room.showWindowEnd - Date.now()
-    if (remaining > 0) {
-      console.log(`[RESTORE] Re-scheduling SHOW_RESOLVE for ${code} in ${remaining}ms`)
-      scheduleShowResolve(code, remaining)
-    } else {
-      // Already expired, resolve immediately
-      scheduleShowResolve(code, 0)
-    }
+    console.log(`[RESTORE] Re-scheduling SHOW_RESOLVE for ${code} in ${remaining}ms`)
+    scheduleShowResolve(code, remaining > 0 ? remaining : 0)
   }
-  // Restore bot turn
   maybeScheduleBotTurn(code, room)
 }
 
@@ -456,6 +403,7 @@ wss.on('connection', (ws) => {
         try {
           const roomCode = await uniqueRoomCode()
           const host     = makePlayer(player.id, player.name, 0)
+          host.online    = true   // mark host online immediately
           const room     = makeRoom(roomCode, host)
           sanitizeRoom(room)
           const logs     = ['Room created! Share the code.']
@@ -485,9 +433,9 @@ wss.on('connection', (ws) => {
         break
       }
 
-      // ── JOIN_ROOM (Task 4 — rejoin support) ─────────────────────
+      // ── JOIN_ROOM ────────────────────────────────────────────────
       case 'JOIN_ROOM': {
-        const { roomCode, player } = data
+        const { roomCode, player, rejoin } = data
         if (!roomCode || !player?.id || !player?.name) {
           return sendTo(ws, { type: 'ERROR', message: 'Invalid join request.' })
         }
@@ -497,7 +445,6 @@ wss.on('connection', (ws) => {
             return sendTo(ws, { type: 'ERROR', message: 'Room not found.' })
           }
 
-          // Task 1 + 12 — always sanitize on load from Redis
           sanitizeRoom(entry.room)
 
           const mem = getEntry(roomCode)
@@ -505,13 +452,13 @@ wss.on('connection', (ws) => {
           ws.roomCode = roomCode
           ws.playerId = player.id
 
-          // Task 6 — cancel cleanup on any join/rejoin
           cancelRoomCleanup(roomCode)
 
           const existingIdx = entry.room.players.findIndex(p => p.id === player.id)
+          console.log('[JOIN_ROOM]', roomCode, player?.id, player?.name, rejoin ? '(rejoin)' : '')
 
           if (existingIdx !== -1) {
-            // Task 4 — REJOIN: player already in room, restore seat
+            // REJOIN: player already in room, restore seat
             const p = entry.room.players[existingIdx]
             p.online         = true
             p.botActive      = p.isBot ? true : false
@@ -519,13 +466,8 @@ wss.on('connection', (ws) => {
 
             entry.logs = [`${player.name} reconnected!`, ...entry.logs]
 
-            // Task 8 — cancel bot turn timer on reconnect
             clearBotTimer(roomCode)
-
-            // Fix 5 — cancel no-humans cleanup if a human rejoined
             cancelRoomCleanup(roomCode)
-
-            // Task 12 — restore timers after Redis load
             restoreTimersAfterLoad(roomCode, entry.room)
 
             await saveRoom(roomCode, entry)
@@ -537,6 +479,15 @@ wss.on('connection', (ws) => {
               room: entry.room, logs: entry.logs,
             })
             broadcastState(roomCode, entry.room, entry.logs)
+
+            // Send yourTurn sound if it's the rejoining player's turn
+            if (entry.room.phase === 'playing' && entry.room.currentTurn === existingIdx) {
+              sendTo(ws, {
+                type:  'SOUND_EVENT',
+                sound: 'yourTurn',
+                id:    `yourTurn_rejoin_${Date.now()}`,
+              })
+            }
           } else {
             // NEW player — only allowed in lobby
             if (entry.room.phase !== 'lobby') {
@@ -545,9 +496,10 @@ wss.on('connection', (ws) => {
             if (entry.room.players.length >= 5) {
               return sendTo(ws, { type: 'ERROR', message: 'Room is full.' })
             }
-            const newPlayer = makePlayer(player.id, player.name, entry.room.players.length)
-            entry.room = { ...entry.room, players: [...entry.room.players, newPlayer] }
-            entry.logs = [`${player.name} joined!`, ...entry.logs]
+            const newPlayer  = makePlayer(player.id, player.name, entry.room.players.length)
+            newPlayer.online = true   // mark online immediately
+            entry.room       = { ...entry.room, players: [...entry.room.players, newPlayer] }
+            entry.logs       = [`${player.name} joined!`, ...entry.logs]
             await saveRoom(roomCode, entry)
             console.log(`[JOIN] ${roomCode} ← "${player.name}" (${entry.room.players.length} players)`)
 
@@ -557,7 +509,6 @@ wss.on('connection', (ws) => {
               room: entry.room, logs: entry.logs,
             })
 
-            // Broadcast to others in room
             mem.clients.forEach(client => {
               if (client !== ws && client.readyState === 1) {
                 client.send(JSON.stringify({ type: 'STATE_SYNC', payload: entry.room, logs: entry.logs }))
@@ -573,10 +524,10 @@ wss.on('connection', (ws) => {
         break
       }
 
-      // ── LIST_ROOMS (Task 11) ─────────────────────────────────────
+      // ── LIST_ROOMS ───────────────────────────────────────────────
       case 'LIST_ROOMS': {
         try {
-          const codes = await getPublicRoomCodes()
+          const codes     = await getPublicRoomCodes()
           const summaries = []
           for (const code of codes) {
             const d = await loadRoom(code)
@@ -593,7 +544,7 @@ wss.on('connection', (ws) => {
         break
       }
 
-      // ── TOGGLE_VISIBILITY (Task 11) ──────────────────────────────
+      // ── TOGGLE_VISIBILITY ────────────────────────────────────────
       case 'TOGGLE_VISIBILITY': {
         const { roomCode, playerId } = data
         try {
@@ -630,23 +581,16 @@ wss.on('connection', (ws) => {
         break
       }
 
-      // ── ADD_BOT (Task 9) ─────────────────────────────────────────
+      // ── ADD_BOT ──────────────────────────────────────────────────
       case 'ADD_BOT': {
         const { roomCode, playerId } = data
         try {
           const entry = await loadRoom(roomCode)
           if (!entry) return sendTo(ws, { type: 'ERROR', message: 'Room not found.' })
-          if (entry.room.hostId !== playerId) {
-            return sendTo(ws, { type: 'ERROR', message: 'Only the host can add bots.' })
-          }
-          if (entry.room.phase !== 'lobby') {
-            return sendTo(ws, { type: 'ERROR', message: 'Can only add bots in lobby.' })
-          }
-          if (entry.room.players.length >= 5) {
-            return sendTo(ws, { type: 'ERROR', message: 'Room is full.' })
-          }
+          if (entry.room.hostId !== playerId) return sendTo(ws, { type: 'ERROR', message: 'Only the host can add bots.' })
+          if (entry.room.phase !== 'lobby')   return sendTo(ws, { type: 'ERROR', message: 'Can only add bots in lobby.' })
+          if (entry.room.players.length >= 5) return sendTo(ws, { type: 'ERROR', message: 'Room is full.' })
 
-          // Name as Bot 1, Bot 2, etc.
           const existingBots = entry.room.players.filter(p => p.isBot).length
           const botName      = `Bot ${existingBots + 1}`
           const botId        = `bot_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`
@@ -666,22 +610,15 @@ wss.on('connection', (ws) => {
         break
       }
 
-      // ── REMOVE_BOT (Task 9) ──────────────────────────────────────
+      // ── REMOVE_BOT ───────────────────────────────────────────────
       case 'REMOVE_BOT': {
-        // Frontend sends targetIdx (array index of bot player).
-        // Legacy clients may send botId. Support both.
         const { roomCode, playerId, botId, targetIdx: removeBotIdx } = data
         try {
           const entry = await loadRoom(roomCode)
           if (!entry) return sendTo(ws, { type: 'ERROR', message: 'Room not found.' })
-          if (entry.room.hostId !== playerId) {
-            return sendTo(ws, { type: 'ERROR', message: 'Only the host can remove bots.' })
-          }
-          if (entry.room.phase !== 'lobby') {
-            return sendTo(ws, { type: 'ERROR', message: 'Can only remove bots in lobby.' })
-          }
+          if (entry.room.hostId !== playerId) return sendTo(ws, { type: 'ERROR', message: 'Only the host can remove bots.' })
+          if (entry.room.phase !== 'lobby')   return sendTo(ws, { type: 'ERROR', message: 'Can only remove bots in lobby.' })
 
-          // Resolve bot by index (preferred) or by id (legacy)
           let botIdx = -1
           if (removeBotIdx !== undefined && removeBotIdx >= 0 && entry.room.players[removeBotIdx]?.isBot) {
             botIdx = removeBotIdx
@@ -692,7 +629,6 @@ wss.on('connection', (ws) => {
 
           const botName = entry.room.players[botIdx].name
           entry.room.players.splice(botIdx, 1)
-          // Re-assign color indices
           entry.room.players = entry.room.players.map((p, i) => ({ ...p, color: i }))
           entry.logs = [`${botName} removed from lobby.`, ...entry.logs]
 
@@ -707,40 +643,28 @@ wss.on('connection', (ws) => {
         break
       }
 
-      // ── ACTION (Task 3 — server-authoritative) ────────────────────
+      // ── ACTION ───────────────────────────────────────────────────
       case 'ACTION': {
         const { roomCode, playerId, action } = data
         try {
           const entry = await loadRoom(roomCode)
           if (!entry) return sendTo(ws, { type: 'ERROR', message: 'Room not found.' })
 
-          // Task 1 — sanitize on load
           sanitizeRoom(entry.room)
 
-          // Task 14 — validate player is in room
           const playerInRoom = entry.room.players.some(p => p.id === playerId)
-          if (!playerInRoom) {
-            return sendTo(ws, { type: 'ERROR', message: 'Player not in room.' })
-          }
+          if (!playerInRoom) return sendTo(ws, { type: 'ERROR', message: 'Player not in room.' })
 
-          // Task 3 — applyServerAction returns {room, logs, error}
           const result = applyServerAction(entry.room, entry.logs, action, playerId)
-          if (result.error) {
-            return sendTo(ws, { type: 'ERROR', message: result.error })
-          }
+          if (result.error) return sendTo(ws, { type: 'ERROR', message: result.error })
 
-          // Task 13 — sanitize → save → broadcast
           sanitizeRoom(result.room)
           entry.room = result.room
           entry.logs = result.logs
           await saveRoom(roomCode, entry)
 
-          // SHOW — schedule server-side resolve timer
-          if (action.type === 'SHOW') {
-            scheduleShowResolve(roomCode, 5000)
-          }
+          if (action.type === 'SHOW') scheduleShowResolve(roomCode, 5000)
 
-          // Game started — remove from public list, schedule bots
           if (action.type === 'START' && entry.isPublic) {
             await removePublicRoom(roomCode)
             broadcastRoomsList()
@@ -748,7 +672,7 @@ wss.on('connection', (ws) => {
 
           broadcastState(roomCode, result.room, result.logs)
 
-          // ── SOUND_EVENT broadcasts ─────────────────────────────
+          // ── Sound events ──────────────────────────────────────
           const SOUND_ACTION_MAP = {
             PASS:                'cardPass',
             USE_REVERSE:         'specialReverse',
@@ -759,6 +683,10 @@ wss.on('connection', (ws) => {
             USE_VITALS:          'specialVitals',
             USE_SUPER_VITALS:    'specialSuperVitals',
             USE_NUKE:            'specialNuke',
+            USE_PUPPETEER:       'specialReverse',   // reuse a subtle sound
+            USE_POSITION_SWAP:   'specialBlindSnatch',
+            SHOW:                'show',
+            END_GAME:            'gameEnd',
           }
           const soundName = SOUND_ACTION_MAP[action.type]
           if (soundName) {
@@ -767,11 +695,27 @@ wss.on('connection', (ws) => {
               sound:      soundName,
               roomCode,
               byPlayerId: playerId,
-              id:         `${action.type}_${Date.now()}_${Math.random().toString(36).slice(2,7)}`,
+              id:         `${action.type}_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
             })
           }
 
-          // Schedule bot turn if needed (Task 8/9)
+          // ── yourTurn sound: send only to the next human player ─
+          if (['PASS','USE_REVERSE','USE_FREEZE','BLIND_SNATCH_PICK',
+               'REVEALED_SNATCH_PICK_CHIT','NUKE_PICK_CARD',
+               'STUN_GRENADE_PICK','FREEZE_PICK','PUPPETEER_PICK',
+               'POSITION_SWAP_PICK'].includes(action.type)
+              && result.room.phase === 'playing') {
+            const nextTurn   = result.room.currentTurn
+            const nextPlayer = result.room.players[nextTurn]
+            if (nextPlayer && !nextPlayer.isBot && !nextPlayer.botActive && nextPlayer.online) {
+              sendToPlayer(roomCode, nextPlayer.id, {
+                type:  'SOUND_EVENT',
+                sound: 'yourTurn',
+                id:    `yourTurn_${action.type}_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+              })
+            }
+          }
+
           maybeScheduleBotTurn(roomCode, result.room)
         } catch (err) {
           console.error('[ACTION]', err)
@@ -794,25 +738,18 @@ wss.on('connection', (ws) => {
           if (!entry) return
 
           if (entry.room.phase === 'lobby') {
-            // Fix 4 — remove the player who explicitly left
             const leavingIdx = entry.room.players.findIndex(p => p.id === playerId && !p.isBot)
             if (leavingIdx !== -1) {
               entry.room.players.splice(leavingIdx, 1)
-              // Re-assign hostId if the host left
-              if (entry.room.hostId === playerId) {
-                entry.room = transferHost(entry.room)
-              }
+              if (entry.room.hostId === playerId) entry.room = transferHost(entry.room)
             }
 
             if (getOnlineHumanCount(entry.room) === 0 || entry.room.players.filter(p => !p.isBot).length === 0) {
-              // No real humans left — delete immediately
               cancelRoomCleanup(roomCode)
               await deleteEmptyLobbyNow(roomCode)
             } else {
               await saveRoom(roomCode, entry)
-              if (mem.clients.size > 0) {
-                broadcastState(roomCode, entry.room, entry.logs)
-              }
+              if (mem.clients.size > 0) broadcastState(roomCode, entry.room, entry.logs)
               if (entry.isPublic) broadcastRoomsList()
             }
           } else {
@@ -841,10 +778,11 @@ wss.on('connection', (ws) => {
     }
   })
 
-  // ── Disconnect handler (Tasks 7, 8) ───────────────────────────────
+  // ── Disconnect handler ────────────────────────────────────────────
   ws.on('close', async () => {
     const { roomCode, playerId } = ws
     if (!roomCode) return
+    console.log('[WS CLOSE]', roomCode, playerId)
 
     const mem = getEntry(roomCode)
     mem.clients.delete(ws)
@@ -861,13 +799,12 @@ wss.on('connection', (ws) => {
       if (playerIdx !== -1 && !entry.room.players[playerIdx].isBot) {
         const player = entry.room.players[playerIdx]
 
-        if (entry.room.phase === 'playing' || entry.room.phase === 'showWindow' || entry.room.phase === 'pendingSpecial') {
-          // Task 8 — Bot takeover mid-game
+        if (['playing', 'showWindow', 'pendingSpecial'].includes(entry.room.phase)) {
+          // Bot takeover mid-game
           player.online         = false
           player.botActive      = true
           player.disconnectedAt = Date.now()
 
-          // Task 7 — Host transfer if disconnected player was host
           if (entry.room.hostId === playerId) {
             entry.room = transferHost(entry.room)
             entry.logs = [`Host transferred to ${entry.room.players.find(p => p.id === entry.room.hostId)?.name ?? 'unknown'}.`, ...entry.logs]
@@ -877,36 +814,25 @@ wss.on('connection', (ws) => {
           await saveRoom(roomCode, entry)
           broadcastState(roomCode, entry.room, entry.logs)
 
-          // Schedule bot turn if it's this player's turn
           if (entry.room.phase === 'playing' && entry.room.currentTurn === playerIdx) {
             scheduleBotTurn(roomCode, playerIdx, 800)
           }
         } else if (entry.room.phase === 'lobby') {
-          // In lobby: mark offline
           player.online = false
+          if (entry.room.hostId === playerId) entry.room = transferHost(entry.room)
 
-          // Task 7 — host transfer in lobby too
-          if (entry.room.hostId === playerId) {
-            entry.room = transferHost(entry.room)
-          }
-
-          // Fix 4 — If no real humans remain online, schedule 15-second cleanup.
-          // (A reconnect within 15s cancels the timer via cancelRoomCleanup.)
           if (getOnlineHumanCount(entry.room) === 0) {
             await saveRoom(roomCode, entry)
+            console.log('[LOBBY CLEANUP SCHEDULED]', roomCode)
             scheduleRoomCleanup(roomCode)
           } else {
             await saveRoom(roomCode, entry)
-            if (mem.clients.size > 0) {
-              broadcastState(roomCode, entry.room, entry.logs)
-            }
+            if (mem.clients.size > 0) broadcastState(roomCode, entry.room, entry.logs)
           }
         } else {
-          // roundEnd / afterShow / ended — mark offline
+          // roundEnd / afterShow / ended
           player.online = false
-          if (entry.room.hostId === playerId) {
-            entry.room = transferHost(entry.room)
-          }
+          if (entry.room.hostId === playerId) entry.room = transferHost(entry.room)
           await saveRoom(roomCode, entry)
           broadcastState(roomCode, entry.room, entry.logs)
         }
@@ -914,8 +840,7 @@ wss.on('connection', (ws) => {
 
       if (entry.isPublic) broadcastRoomsList()
 
-      // Fix 5 — If no real humans remain online during an active game,
-      // stop bots and schedule room cleanup after 2 minutes.
+      // No humans online during active game — stop bots, schedule 2-min cleanup
       if (['playing','showWindow','pendingSpecial','roundEnd','afterShow'].includes(entry.room.phase)) {
         const hasOnlineHuman = entry.room.players.some(p => !p.isBot && p.online)
         if (!hasOnlineHuman) {
@@ -925,17 +850,15 @@ wss.on('connection', (ws) => {
           if (mem2.cleanupTimer) clearTimeout(mem2.cleanupTimer)
           mem2.cleanupTimer = setTimeout(async () => {
             mem2.cleanupTimer = null
-            // Re-check: if a human rejoined, cancel
             const fresh = await loadRoom(roomCode).catch(() => null)
             if (!fresh) return
-            const stillNoHuman = !fresh.room.players.some(p => !p.isBot && p.online)
-            if (!stillNoHuman) return
+            if (fresh.room.players.some(p => !p.isBot && p.online)) return
             console.log(`[CLEANUP] Still no humans — deleting room ${roomCode}`)
             await deleteRoom(roomCode).catch(() => {})
             await removePublicRoom(roomCode).catch(() => {})
             entries.delete(roomCode)
             broadcastRoomsList()
-          }, 2 * 60 * 1000) // 2 minutes
+          }, 2 * 60 * 1000)
         }
       }
     } catch (err) {
