@@ -205,6 +205,7 @@ function scheduleRoomCleanup(code) {
       // Only clean up if still in lobby
       if (data.room.phase !== 'lobby') return
       console.log(`[CLEANUP] Deleting empty lobby ${code}`)
+      console.log('[ROOM DELETED]', code)
       await deleteRoom(code)
       await removePublicRoom(code)
       entries.delete(code)
@@ -220,6 +221,7 @@ function cancelRoomCleanup(code) {
   if (entry.cleanupTimer) {
     clearTimeout(entry.cleanupTimer)
     entry.cleanupTimer = null
+    console.log(`[LOBBY CLEANUP CANCELLED]`, code)
     console.log(`[CLEANUP] Cancelled cleanup for ${code}`)
   }
 }
@@ -393,6 +395,11 @@ function scheduleShowResolve(code, remainingMs = 5000) {
       sanitizeRoom(result.room)
       await saveRoom(code, { ...data, room: result.room, logs: result.logs })
       broadcastState(code, result.room, result.logs)
+      // Broadcast round-result sound to all players
+      broadcastToRoom(code, {
+        type: 'SOUND_EVENT', sound: 'roundResult', roomCode: code,
+        id: `SHOW_RESOLVE_${Date.now()}_${Math.random().toString(36).slice(2,7)}`,
+      })
 
       entry.timers.roundEnd = setTimeout(async () => {
         try {
@@ -456,6 +463,7 @@ wss.on('connection', (ws) => {
         try {
           const roomCode = await uniqueRoomCode()
           const host     = makePlayer(player.id, player.name, 0)
+          host.online    = true   // mark host online immediately
           const room     = makeRoom(roomCode, host)
           sanitizeRoom(room)
           const logs     = ['Room created! Share the code.']
@@ -509,6 +517,7 @@ wss.on('connection', (ws) => {
           cancelRoomCleanup(roomCode)
 
           const existingIdx = entry.room.players.findIndex(p => p.id === player.id)
+          console.log('[JOIN_ROOM]', roomCode, player?.id, player?.name)
 
           if (existingIdx !== -1) {
             // Task 4 — REJOIN: player already in room, restore seat
@@ -530,6 +539,7 @@ wss.on('connection', (ws) => {
 
             await saveRoom(roomCode, entry)
             console.log(`[REJOIN] ${roomCode} ← "${player.name}"`)
+            console.log(`[REJOIN EXISTING PLAYER]`, roomCode, player.id)
 
             sendTo(ws, {
               type: 'JOINED_ROOM', roomCode,
@@ -546,6 +556,7 @@ wss.on('connection', (ws) => {
               return sendTo(ws, { type: 'ERROR', message: 'Room is full.' })
             }
             const newPlayer = makePlayer(player.id, player.name, entry.room.players.length)
+            newPlayer.online = true   // mark online immediately so lobby shows correct status
             entry.room = { ...entry.room, players: [...entry.room.players, newPlayer] }
             entry.logs = [`${player.name} joined!`, ...entry.logs]
             await saveRoom(roomCode, entry)
@@ -759,6 +770,8 @@ wss.on('connection', (ws) => {
             USE_VITALS:          'specialVitals',
             USE_SUPER_VITALS:    'specialSuperVitals',
             USE_NUKE:            'specialNuke',
+            SHOW:                'show',
+            END_GAME:            'gameEnd',
           }
           const soundName = SOUND_ACTION_MAP[action.type]
           if (soundName) {
@@ -845,6 +858,7 @@ wss.on('connection', (ws) => {
   ws.on('close', async () => {
     const { roomCode, playerId } = ws
     if (!roomCode) return
+    console.log('[WS CLOSE]', roomCode, playerId)
 
     const mem = getEntry(roomCode)
     mem.clients.delete(ws)
@@ -894,6 +908,7 @@ wss.on('connection', (ws) => {
           // (A reconnect within 15s cancels the timer via cancelRoomCleanup.)
           if (getOnlineHumanCount(entry.room) === 0) {
             await saveRoom(roomCode, entry)
+            console.log('[LOBBY CLEANUP SCHEDULED]', roomCode)
             scheduleRoomCleanup(roomCode)
           } else {
             await saveRoom(roomCode, entry)
